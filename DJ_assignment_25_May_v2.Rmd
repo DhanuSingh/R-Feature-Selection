@@ -1,0 +1,553 @@
+---
+title: "Assignment1"
+author: "Songfen Lu"
+date: "4/16/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load package,message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(Rtsne)
+library(gridExtra)
+library(grid)
+library(reshape)
+library(gplots)
+library(caret)
+library(randomForest)
+library(class)
+library(glmnet)
+library(qwraps2)
+library(ROCR)
+```
+
+### LOad the data
+```{r load data}
+#type 6
+data.clinical <- read.csv("DonorInformation.csv")
+dim(data.clinical)
+#head(data.clinical)
+#type 1,2,4,5
+data.luminex <- read.csv("ProteinAndPathologyQuantifications.csv")
+dim(data.luminex)
+#head(data.luminex)
+#data.luminex$structure_acronym
+#type 3
+data.fpkm <- read.csv("fpkm_table_unnormalized.csv")
+dim(data.fpkm)
+#head(data.fpkm)
+
+# gene info
+data.gene <- read.csv("rows-genes.csv")
+dim(data.gene)
+#head(data.gene)
+
+data.profile <- read.csv("columns-samples.csv")
+dim(data.profile)
+#head(data.profile)
+```
+
+
+
+* 377 samples are collected from 4 different brain regions with respect to 107 donors. 
+
+### data pre-processing
+```{r pre-processing data 1}
+# only 7 columns are allowed to use in classification
+data.nongene <- merge(data.luminex, data.clinical[, c(
+"donor_id",
+"age",
+"sex",
+"apo_e4_allele",
+"education_years",
+"age_at_first_tbi",
+"longest_loc_duration",
+"num_tbi_w_loc",
+"act_demented"
+)], by = "donor_id")
+head(data.nongene)
+```
+
+```{r pre-processing data 2}
+
+
+# transpose fpkm as the header refers to donor and the first column refers to the gene
+names(data.fpkm)[1] <- "gene_id"
+data.fpkm <-
+merge(data.fpkm, data.gene[, c("gene_id", "gene_symbol")], by = "gene_id") # mapping gene_id , gene_symbol and chromosome
+
+# transpose fpkm as the header refers to donor_id
+#Transposing a data.frame that contains a string column in it turns ALL values into strings
+n <- data.fpkm$gene_symbol
+
+# transpose all but gene_symbol, gene_id
+data.fpkm.t <-
+as.data.frame(t(data.fpkm[, !names(data.fpkm) %in% c("gene_symbol", "gene_id")]))
+colnames(data.fpkm.t) <- n
+data.fpkm.t$rnaseq_profile_id <- factor(rownames(data.fpkm.t))
+data.fpkm.t$rnaseq_profile_id <-
+substring(data.fpkm.t$rnaseq_profile_id, 2) # remove 'X' at the begining
+data.fpkm.t <-
+merge(data.fpkm.t, data.profile[, c("rnaseq_profile_id", "donor_id", "structure_id")])
+
+# all the features
+data.allfeatures <-
+merge(data.nongene, data.fpkm.t, by = c("donor_id", "structure_id"))
+# remove all useless columns eg rnaseq_profile_id
+data.allfeatures <-
+data.allfeatures[, !names(data.allfeatures) %in% c('rnaseq_profile_id', 'donor_name', 'structure_id')]
+head(data.allfeatures)
+# convert na value to 0
+data.allfeatures[is.na(data.allfeatures)] <- 0
+
+# check the levels of factor variables
+levels(data.allfeatures$structure_acronym)
+levels(data.allfeatures$age)
+levels(data.allfeatures$sex)
+levels(data.allfeatures$apo_e4_allele)
+levels(data.allfeatures$longest_loc_duration)
+
+# convert factor to numeric
+data.allfeatures$structure_acronym.numeric <- as.numeric(as.character(recode(data.allfeatures$structure_acronym, 'FWM' = '1',
+                                                                              'HIP' = '2',
+                                                                              'PCx' = '3',
+                                                                              'TCx' = '4')))
+data.allfeatures$age.numeric <- as.numeric(as.character(recode(data.allfeatures$age, '100+' = '100',
+                                                                '90-94' = '92',
+                                                                '95-99' = '97')))
+data.allfeatures$sex.numeric <- as.numeric(as.character(recode(data.allfeatures$sex, 'F' = '0',
+                                                                'M' = '1')))
+data.allfeatures$apo_e4_allele.numeric <- as.numeric(as.character(recode(data.allfeatures$apo_e4_allele, 'N' = '1',
+                                                                          'Y' = '2',
+                                                                          'N/A' = '0')))
+# convert all time unit to seconds
+data.allfeatures$longest_loc_duration.numeric <- as.numeric(as.character(recode(data.allfeatures$longest_loc_duration, '< 10 sec' = '10',
+                                                                                 '> 1 hr' = '3600',
+                                                                                 '1-2 min' = '90',
+                                                                                 '10 min - 1 hr' = '2100',
+                                                                                 '10 sec - 1 min' = '35',
+                                                                                 '3-5 min' = '240',
+                                                                                 '6-9 min' = '450',
+                                                                                 'Unknown or N/A' = '0')))
+# recode all time to levels, eg. "<10 sec" as level 1
+data.allfeatures$longest_loc_duration.levels <- as.numeric(as.character(recode(data.allfeatures$longest_loc_duration, '< 10 sec' = '1',
+                                                                                '10 sec - 1 min' = '2',
+                                                                                '1-2 min' = '3',
+                                                                                '3-5 min' = '4',
+                                                                                '6-9 min' = '5',
+                                                                                '10 min - 1 hr' = '6',
+                                                                                '> 1 hr' = '7',
+                                                                                'Unknown or N/A' = '0')))
+data.allfeatures$act_demented <- as.numeric(data.allfeatures$act_demented) - 1
+
+
+```
+```{r removing_80%zero_Genes}
+gene.name <- data.fpkm$gene_symbol
+gene.var <- numeric(length(gene.name))
+gene.zeros.percentage <- numeric(length(gene.name))
+
+# variance
+for (i in 1:length(gene.name)) {
+    #gene.var <- c(gene.var,var(data.allfeatures[,gene.name[i]]))
+  if (typeof(data.allfeatures[,gene.name[i]])=='double'){
+    gene.var[i] <- var(data.allfeatures[,gene.name[i]])
+  }
+  else{
+    gene.var[i] <- 0
+  }
+  zerocount=sum(data.allfeatures[,gene.name[i]]==0)
+  gene.zeros.percentage[i] <- zerocount/377
+  
+}
+gene.var.df <- data.frame(gene.name,gene.var,gene.zeros.percentage)
+
+# reduce the variables which have more than 80% zero
+zero.remove <- c(gene.var.df[gene.var.df$gene.zeros.percentage>0.8,]$gene.name)
+
+# remove the useless variables from data.allfeatures
+data.allfeatures.remove <- data.allfeatures[,-zero.remove]
+data.allfeatures.numeric <- select(data.allfeatures.remove, -c(longest_loc_duration, structure_acronym, age, sex, apo_e4_allele))
+data.allfeatures.numeric <- select(data.allfeatures.numeric, -c(TRNA, TRND))
+```
+
+
+```{r TrainTestSplit}
+set.seed(1)
+
+inTrain <- createDataPartition(data.allfeatures.numeric$act_demented, p = 0.5)[[1]]
+dataTrain <- data.allfeatures.numeric[inTrain,]
+dataTest <- data.allfeatures.numeric[-inTrain,]
+```
+
+
+```{r FoldChange}
+colnum <- which(colnames(dataTrain) == "act_demented")
+dataTrain.byClass <- split(dataTrain[, -colnum], dataTrain$act_demented)
+feature.mean.byClass <- sapply(dataTrain.byClass, colMeans)
+feature.foldChange <- abs(log2(feature.mean.byClass[,1]/feature.mean.byClass[,2]))
+feature.sorted <- sort(feature.foldChange, decreasing = TRUE)
+plot(feature.sorted)
+```
+###KNN on all features
+
+```{r fitclassifier all features}
+#fitting the classifier on full expression dataset
+preds.all <- knn(train=dataTrain[,- colnum], test=dataTest[,- colnum], cl=dataTrain$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.all, dataTest$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy by selecting all the features is", acc.all)
+```
+
+```{r Knn_selected}
+
+values = c(0.2, 0.3, 0.4, 0.6, 0.8)
+knn.TP <- knn.TN <- knn.FP <- knn.FN <- c()
+knn.acc <- knn.acc.all <- c()
+for(i in 1:length(values)){
+  feature.selected.fold <- feature.sorted[which(feature.sorted>values[i])]
+    cat("\nthe no of features selected after fold method is", length(feature.selected.fold))
+     # apply knn for classification
+     preds.test <- knn(train=dataTrain[,names(feature.selected.fold)], test=dataTest[,names(feature.selected.fold)],     cl=dataTrain$act_demented, k=3, prob=TRUE)
+   cm = as.matrix(table(Actual = dataTest$act_demented, Predicted = preds.test))
+   knn.acc <- c(knn.acc, sum(diag(cm))/length(dataTest$act_demented))
+   knn.acc.all = c(knn.acc.all, acc.all)
+ }
+plot(knn.acc, type = "b", col="red", ylim = c(0,1), ylab = "Accuracy")
+lines(knn.acc.all, type="b", col="blue")
+legend("bottomleft", c("selected features", "all features"), col=c("red", "blue"), lty=c(1,1))
+```
+```{r threshold for maximum accuracy}
+thresh_select = values[which.max(knn.acc)]
+feature.selected.fold <- feature.sorted[which(feature.sorted>thresh_select)]
+#feature.selected.fold <- feature.sorted[1:1000]
+names_selected = names(feature.selected.fold)
+preds.foldfiltered <- knn(train=dataTrain[,names_selected], test=dataTest[,names_selected],     cl=dataTrain$act_demented, k=3, prob=TRUE)
+cat("The number of features selected after fold method is", length(names_selected))
+```
+
+###P test based feature selection
+
+```{r ptest_based_feature_selection}
+dataTrain.byClass <- split(dataTrain[,-colnum], dataTrain$act_demented)
+# perform a t-test
+feature.pvalues <- c()
+for(i in 1:(ncol(dataTrain)-1)) {
+  feature.pvalues <- c(feature.pvalues, t.test(dataTrain.byClass[[1]][,i], dataTrain.byClass[[2]][,i])$p.value)
+}
+names(feature.pvalues) <- colnames(dataTrain[,-colnum])
+```
+
+```{r select pvaluebased features}
+# filter the top 6731 most discriminative features based on p-values
+filtered.features2 <- names(sort(feature.pvalues)[1:6731])
+
+#Display KNN results on all and fold and p value based feature selection
+preds.pvalfiltered <- knn(train=dataTrain[,filtered.features2], test=dataTest[,filtered.features2],     cl=dataTrain$act_demented, k=3, prob=TRUE)
+table(preds.all, dataTest$act_demented)
+table(preds.foldfiltered, dataTest$act_demented)
+table(preds.pvalfiltered, dataTest$act_demented)
+```
+### Adding donor information to explore its effect on model 
+Discussion: Should we add logistic or svm instead of KNN (too simple) to analyze improvement possibility
+
+```{r selecting features forecefully with donor information}
+selected.features <- c(filtered.features2, "age.numeric", "sex.numeric", "apo_e4_allele.numeric", "education_years", "age_at_first_tbi", "longest_loc_duration.numeric", "num_tbi_w_loc","structure_acronym.numeric", "act_demented")
+preds.pvalfiltered.donorinfo <- knn(train=dataTrain[, selected.features], test=dataTest[,selected.features],cl=dataTrain$act_demented, k=3, prob=TRUE)
+table(preds.pvalfiltered.donorinfo, dataTest$act_demented)
+```
+
+### Lasso Regression for feature selection
+```{r Lasso_Feat_Select on top filtered features from T test}
+
+# create learning matrix X and regression response variable Y
+selected.features.reg <- c(filtered.features2, "age.numeric", "sex.numeric", "apo_e4_allele.numeric", "education_years", "age_at_first_tbi", "longest_loc_duration.numeric", "num_tbi_w_loc","structure_acronym", "act_demented")
+
+
+x <- model.matrix(act_demented ~ ., data.allfeatures[,selected.features.reg])[,-1]
+y <- data.allfeatures$act_demented
+
+# partition the data into training and test sets (50% each)
+set.seed(1) 
+train <- sample(1:nrow(x), nrow(x)/2)
+test <- -train
+y.test <- y[test]
+
+# set the range of lambda values to be tested.
+grid <- 10^seq(8,-2, length=100)
+
+# alpha is the elasticnet mixing parameter with 0 correspond to Ridge regression and 1 correspond to Lasso and anything in between correspond to elastic net
+lasso.mod <- glmnet(x[train,], y[train], alpha=1, lambda=grid)
+dim(coef(lasso.mod))
+par(mfrow=c(1,2))
+plot(lasso.mod, xvar="lambda", label=TRUE)
+
+set.seed (1)
+# Using cross-validation for Lasso to find the best lambda (based on cvm "mean cross-validated error")
+cv.lasso <- cv.glmnet (x[train,], y[train], alpha=1)
+plot(cv.lasso)
+
+bestlam <- cv.lasso$lambda.min 
+# predict on test set using optimal lambda value estimated by CV
+lasso.pred <- predict (lasso.mod, s=bestlam, newx=x[test,]) 
+# Lasso for feature selection
+lasso.coef=predict(lasso.mod, type="coefficients", s=bestlam)
+selected.nongene.demented <- attr(lasso.coef,"Dimnames")[[1]][attr(lasso.coef,"i")+1][-1]
+```
+```{r Lasso to select top 50}
+print('Top 50 important features')
+abs_coeff <- abs(lasso.coef)
+sort_coeff <- abs_coeff[order(abs_coeff, decreasing = TRUE)[1:10], ]
+#selected.reg.colnames <- attr(sort_coeff,"Dimnames")[[1]][attr(sort_coeff,"i")+1][-1]
+top_LR = c("LINC00303",   "ihc_a_beta", "UQCRHP2", "LYPLA2P2", "TPTE2P2", "LOC100419775", "UBASH3A", "LOC105375847", "LOC105376797")
+sort_coeff
+```
+### Random Forest based feature selection
+```{r Bagging_feature_selection}
+data.copy <- dataTrain[,selected.features]
+names(data.copy) <- make.names(names(data.copy))
+bag.features <- randomForest(factor(act_demented)~., data=data.copy, importance=TRUE, mtry = length(selected.features)-1)
+#print(bag.features$importance)
+```
+```{r Scoring}
+scores = bag.features$importance  
+scores_gini = scores[,-1][,-1][,-1]
+top_RF = scores_gini[order(scores_gini, decreasing = TRUE)[1:200]]
+top_RF_sel = c("POLE",    "PLXNB2",    "HRSP12",   "C5orf63",     "TCEA3",     "NACC2",   "PRR13P5",      "DHFR",   "SLC37A2", "ATE1")
+top_RF
+```
+
+
+
+### Trying to find overlap in top 100 features predicting from Random Forest and Lasso, (remove if none :p)
+```{r finding overlap}
+C <- intersect(top_reg, top_100)
+```
+
+
+### Logistic Regression
+SVM can be a useful classifier when it comes to small dataset as it only uses support vectors to help build its hyperplane. However we also try logistic regression to compare and benchmark the model against SVM. In order to benchmark we look at the metrics like precision, accuracy, recall and f score. We also implement KNN classifier. KNN classifier is a simple and easy one, it exploits spatial symmetry by assuming that similar data points will lie in a cluster. In this way when we take k neighbor of a given data points, its highly likely to be upvoted by the class which it clusters to in the region. 
+
+
+```{r logistic regression on features by lasso regression (lr)}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+#dataTrain.reg <- data.allfeatures[inTrain,]
+#dataTest.reg <- data.allfeatures[-inTrain,]
+
+
+logit.model.lr <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top10_LR, "act_demented")],
+                     method = "glm", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.lr <- predict(logit.model.lr, newdata = dataTest[,top10_LR])
+confusionMatrix(logit.pred.lr, as.factor(dataTest$act_demented))
+
+```
+
+```{r prec recall f score for features selection by Lasso regression (lr)}
+predictions.lr = predict(logit.model.lr, newdata = dataTest[,top10_LR])
+precision.lr <- posPredValue(predictions.lr, as.factor(dataTest$act_demented), positive="1")
+recall.lr <- sensitivity(predictions.lr, as.factor(dataTest$act_demented), positive="1")
+
+F1.lr <- (2 * precision.lr * recall.lr) / (precision.lr + recall.lr)
+cat("\nThe recall is", recall.lr)
+cat("\nThe precision is", precision.lr)
+cat("\nThe F1 score is", F1.lr)
+```
+
+
+
+
+```{r logistic regression for RF Selected features}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+#dataTrain.reg <- data.allfeatures[inTrain,]
+#dataTest.reg <- data.allfeatures[-inTrain,]
+
+
+logit.model.rf <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top_RF_sel, "act_demented")],
+                     method = "glm", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.rf <- predict(logit.model.rf, newdata = dataTest[,top_RF_sel])
+confusionMatrix(logit.pred.rf, as.factor(dataTest$act_demented))
+
+```
+
+```{r prec recall f score}
+predictions.rf = predict(logit.model.rf, newdata = dataTest[,top_RF_sel])
+precision.rf <- posPredValue(predictions.rf, as.factor(dataTest$act_demented), positive="1")
+recall.rf <- sensitivity(predictions.rf, as.factor(dataTest$act_demented), positive="1")
+
+F1.rf <- (2 * precision.rf * recall.rf) / (precision.rf + recall.rf)
+cat("\nThe recall is", recall.rf)
+cat("\nThe precision is", precision.rf)
+cat("\nThe F1 score is", F1.rf)
+
+```
+
+```{r plotting results}
+classifiers = c("KNN", "LR", "SVM")
+# classifiers on x and performance metric on y, plots for lasso selection and random forest based selection
+```
+
+
+
+
+### Experiment to see the most important Non gene features
+Discussion: Hoping to get interesting results especially on the brain region but the results do not generate any.
+```{r Lasso_FeatureSelection_only on Non Gene}
+
+# create learning matrix X and regression response variable Y
+#selected.features.reg <- c(filtered.features2, "age", "sex", "apo_e4_allele", "education_years", "age_at_first_tbi", "longest_loc_duration", "num_tbi_w_loc","structure_acronym", "act_demented")
+
+nongene.features <- c("ihc_a_syn","ihc_tau2_ffpe","ihc_at8_ffpe","ihc_at8","ihc_ptdp_43_ffpe","ihc_a_beta_ffpe","ihc_a_beta","ihc_iba1_ffpe","ihc_gfap_ffpe","ptau_ng_per_mg","vegf_pg_per_mg","ab42_over_ab40_ratio","tnf_a_pg_per_mg","il_10_pg_per_mg","tau_ng_per_mg","isoprostane_pg_per_mg" ,"il_6_pg_per_mg","il_1b_pg_per_mg","ptau_over_tau_ratio","il_4_pg_per_mg","rantes_pg_per_mg","ab40_pg_per_mg","a_syn_pg_per_mg","ifn_g_pg_per_mg","mcp_1_pg_per_mg","bdnf_pg_per_mg","mip_1a_pg_per_mg","il_7_pg_per_mg","ab42_pg_per_mg","age.numeric","sex.numeric","apo_e4_allele.numeric","education_years","age_at_first_tbi","longest_loc_duration.numeric","num_tbi_w_loc")
+
+x <- model.matrix(act_demented ~ ., data.allfeatures[,c(nongene.features,"structure_acronym", "act_demented")])[,-1]
+y <- data.allfeatures$act_demented
+
+# partition the data into training and test sets (50% each)
+set.seed(1) 
+train <- sample(1:nrow(x), nrow(x)/2)
+test <- -train
+y.test <- y[test]
+
+# set the range of lambda values to be tested.
+grid <- 10^seq(8,-2, length=100)
+
+# alpha is the elasticnet mixing parameter with 0 correspond to Ridge regression and 1 correspond to Lasso and anything in between correspond to elastic net
+lasso.mod <- glmnet(x[train,], y[train], alpha=1, lambda=grid)
+dim(coef(lasso.mod))
+par(mfrow=c(1,2))
+plot(lasso.mod, xvar="lambda", label=TRUE)
+
+set.seed (1)
+# Using cross-validation for Lasso to find the best lambda (based on cvm "mean cross-validated error")
+cv.lasso <- cv.glmnet (x[train,], y[train], alpha=1)
+plot(cv.lasso)
+
+bestlam <- cv.lasso$lambda.min 
+# predict on test set using optimal lambda value estimated by CV
+lasso.pred <- predict (lasso.mod, s=bestlam, newx=x[test,]) 
+# Lasso for feature selection
+lasso.coef=predict(lasso.mod, type="coefficients", s=bestlam)
+selected.nongene.demented <- attr(lasso.coef,"Dimnames")[[1]][attr(lasso.coef,"i")+1][-1]
+```
+
+
+```{r Lasso to select top 10}
+print('Top 10 most important non gene features')
+abs_coeff = abs(lasso.coef)
+abs_coeff[order(abs_coeff, decreasing = TRUE)[1:10], ]
+
+```
+
+
+```{r partition}
+set.seed(1)
+
+inTrain <- createDataPartition(data.allfeatures.numeric$act_demented, p = 0.5)[[1]]
+dataTrain <- data.allfeatures.numeric[inTrain,]
+dataTest <- data.allfeatures.numeric[-inTrain,]
+
+```
+
+
+### An experiment run to build model on different brain region. Did this to identify different brain regions importance in predicting dementia
+```{r comparing brain regions to see if model developed on individual region gives any insight}
+
+data.allfeatures[is.na(data.allfeatures)] <- 0
+
+
+data.tcx <- subset(data.allfeatures, structure_acronym =='TCx')
+data.pcx <- subset(data.allfeatures, structure_acronym =='PCx')
+data.hip <- subset(data.allfeatures, structure_acronym =='HIP')
+data.fwm <- subset(data.allfeatures, structure_acronym =='FWM')
+
+
+
+
+set.seed(1)
+
+inTraint <- createDataPartition(data.tcx$act_demented, p = 0.5)[[1]]
+inTrainp <- createDataPartition(data.pcx$act_demented, p = 0.5)[[1]]
+inTrainh <- createDataPartition(data.hip$act_demented, p = 0.5)[[1]]
+inTrainf <- createDataPartition(data.fwm$act_demented, p = 0.5)[[1]]
+
+
+
+
+data.tcx.train <-data.tcx[inTraint,]
+data.tcx.test <- data.tcx[-inTraint,]
+data.pcx.train <- data.pcx[inTrainp,]
+data.pcx.test <- data.pcx[-inTrainp,]
+
+data.hip.train <-data.hip[inTrainh,]
+data.hip.test <- data.hip[-inTrainh,]
+data.fwm.train <- data.fwm[inTrainf,]
+data.fwm.test <- data.fwm[-inTrainf,]
+
+data.tcx.train <- as.data.frame(sapply(data.tcx.train, as.numeric))
+data.tcx.test <- as.data.frame(sapply(data.tcx.test, as.numeric))
+
+
+data.pcx.train <- as.data.frame(sapply(data.pcx.train, as.numeric))
+data.pcx.test <- as.data.frame(sapply(data.pcx.test, as.numeric))
+
+data.hip.train <- as.data.frame(sapply(data.hip.train, as.numeric))
+data.hip.test <- as.data.frame(sapply(data.hip.test, as.numeric))
+
+data.fwm.train <- as.data.frame(sapply(data.fwm.train, as.numeric))
+data.fwm.test <- as.data.frame(sapply(data.fwm.test, as.numeric))
+
+
+colnum <- which(colnames(data.tcx.train) == "act_demented")
+preds.tcx <- knn(train=data.tcx.train[,- colnum], test=data.tcx.test[,- colnum], cl=data.tcx.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.tcx, data.tcx.test$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy on TCX is", acc.all)
+cm.t= cm.all
+table(preds.tcx, data.tcx.test$act_demented)
+
+
+colnum <- which(colnames(data.pcx.train) == "act_demented")
+preds.pcx <- knn(train=data.pcx.train[,- colnum], test=data.pcx.test[,- colnum], cl=data.pcx.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.pcx, data.pcx.test$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy on pCX is", acc.all)
+cm.p = cm.all
+table(preds.pcx, data.pcx.test$act_demented)
+
+
+colnum <- which(colnames(data.hip.train) == "act_demented")
+preds.hip <- knn(train=data.hip.train[,- colnum], test=data.hip.test[,- colnum], cl=data.hip.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.hip, data.hip.test$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy on hip is", acc.all)
+cm.h = cm.all
+table(preds.hip, data.hip.test$act_demented)
+
+
+colnum <- which(colnames(data.fwm.train) == "act_demented")
+preds.fwm <- knn(train=data.fwm.train[,- colnum], test=data.fwm.test[,- colnum], cl=data.fwm.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.fwm, data.fwm.test$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy on fwm is", acc.all)
+cm.f = cm.all
+table(preds.fwm, data.fwm.test$act_demented)
+```
+
+
+
+
+
+
+
