@@ -1,0 +1,1121 @@
+---
+title: "GroupProject"
+author: "Ziwei Li(480312695) Songfen Fen(480164865) Dhanu Vardhan Singh Jhala(480563862)"
+date: "21/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load packages
+
+```{r load package,results='hide', message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(Rtsne)
+library(gridExtra)
+library(grid)
+library(reshape)
+library(gplots)
+library(data.table)
+library(rgl) # 3d plot
+library(caret)
+library(randomForest)
+library(class)
+library(glmnet)
+library(qwraps2)
+library(ROCR)
+library(e1071)
+library(factoextra)
+```
+
+# Exploratory Data analysis
+
+## Load csv data
+
+The clinical data downloaded from the website contains 50 dementia samples and 57 No dementia samples. 
+
+```{r load data}
+#type 6
+data.clinical <- read.csv("DonorInformation.csv")
+table(data.clinical$act_demented)
+#dim(data.clinical)
+#head(data.clinical)
+
+#type 1,2,4,5
+data.luminex <- read.csv("ProteinAndPathologyQuantifications.csv")
+dim(data.luminex)
+#head(data.luminex)
+#data.luminex$structure_acronym
+
+#type 3
+data.fpkm <- read.csv("gene_expression_matrix_2016-03-03/fpkm_table_unnormalized.csv")
+#dim(data.fpkm)
+#head(data.fpkm)
+
+# gene info
+data.gene <- read.csv("gene_expression_matrix_2016-03-03/rows-genes.csv")
+#dim(data.gene)
+#head(data.gene)
+
+data.profile <- read.csv("gene_expression_matrix_2016-03-03/columns-samples.csv")
+dim(data.profile)
+#head(data.profile)
+```
+
+## Build all features dataset
+
+Select and merge the following 7 features from DonorInformation.csv.
+
+```{r merge 7 fetures from data.clinical}
+# only 7 columns are allowed to use in classification
+data.nongene <- merge(data.luminex, data.clinical[, c("donor_id",
+                                                      "age",
+                                                      "sex",
+                                                      "apo_e4_allele",
+                                                      "education_years",
+                                                      "age_at_first_tbi",
+                                                      "longest_loc_duration",
+                                                      "num_tbi_w_loc",
+                                                      "act_demented")], by = "donor_id")
+#head(data.nongene)
+```
+
+
+Transpose the fpkm dataset and let the headers refervto donor gene information. Then use the "gene_id" in as the column used when merging. Remove columns that are useless for classification, such as "rnaseq_profile_id" etc.
+
+```{r build data.allfeatures}
+# transpose fpkm as the header refers to donor and the first column refers to the gene
+names(data.fpkm)[1] <- "gene_id"
+data.fpkm <- merge(data.fpkm, data.gene[, c("gene_id", "gene_symbol")], by = "gene_id") # mapping gene_id , gene_symbol and chromosome
+
+# transpose fpkm as the header refers to donor_id
+# transposing a data.frame that contains a string column in it turns ALL values into strings
+n <- data.fpkm$gene_symbol
+
+# transpose all but  gene_symbol, gene_id
+data.fpkm.t <- as.data.frame(t(data.fpkm[, !names(data.fpkm) %in% c("gene_symbol", "gene_id")]))
+colnames(data.fpkm.t) <- n
+data.fpkm.t$rnaseq_profile_id <- factor(rownames(data.fpkm.t))
+data.fpkm.t$rnaseq_profile_id <- substring(data.fpkm.t$rnaseq_profile_id, 2) # remove 'X' at the begining
+data.fpkm.t <- merge(data.fpkm.t, data.profile[, c("rnaseq_profile_id", "donor_id", "structure_id")])
+
+# all the features
+data.allfeatures <- merge(data.nongene, data.fpkm.t, by = c("donor_id", "structure_id"))
+# remove all useless columns eg rnaseq_profile_id
+data.allfeatures <- data.allfeatures[, !names(data.allfeatures) %in% c('rnaseq_profile_id', 'donor_name', 'structure_id')]
+#head(data.allfeatures)
+dim(data.allfeatures)
+```
+
+## Recode and handling missing values
+
+We try to reduce the gene features, first we check with NA values in the gene features. After calculating the 80%-NA columns, it returns 0. So we just add the totalcount in the for loop and found that totalcount equals to 1251. That means the gene dataset has little missing vlalues compared to its size 50k * 377. Besides, the total missing values for the whole dataset is also 1251.
+
+```{r 80%_NA_check on gene data}
+gene.name <- data.fpkm$gene_symbol
+gene.na.per <- numeric(length(gene.name))
+
+totalcount <- 0
+# calculate the na percentge of each gene feature
+for (i in 1:length(gene.name)) {
+  nacount=sum(is.na(data.allfeatures[,gene.name[i]]) == TRUE)
+  gene.na.per[i] <- nacount/nrow(data.allfeatures)
+}
+sum(is.na(data.allfeatures))
+
+# reduce the variables which have more than 80% na
+gene.na.df <- data.frame(gene.name,gene.na.per)
+na.remove <- c(gene.na.df[gene.na.df$gene.na.per>0.8,]$gene.name)
+na.remove
+```
+
+Based on the results of the former chunck, the NA percentage is much less than 1%. Thus, replacing NA values with 0 in dataset would be an easy and efficient way to handle with the missing values. Furthermore, we also did some recode on the factor variables. For "longest_loc_duration", the time are measured in different units and if we transformed all time to seconds, the variance could be too large. Therefore, instead of transforming into the same units, we recoded it to 8 defferent levels.
+
+```{r NA replacement and recode}
+# convert na values to 0
+data.allfeatures[is.na(data.allfeatures)] <- 0
+
+# check the levels of factor variables
+levels(data.allfeatures$structure_acronym)
+levels(data.allfeatures$age)
+levels(data.allfeatures$sex)
+levels(data.allfeatures$apo_e4_allele)
+levels(data.allfeatures$longest_loc_duration)
+levels(data.allfeatures$act_demented)
+
+# recode factor variables
+data.allfeatures$structure_acronym.numeric <- as.numeric(
+  as.character(recode(data.allfeatures$structure_acronym, 
+                      'FWM' = '1',
+                      'HIP' = '2',
+                      'PCx' = '3',
+                      'TCx' = '4')))
+data.allfeatures$age.numeric <- as.numeric(
+  as.character(recode(data.allfeatures$age, 
+                      '100+' = '100',
+                      '90-94' = '92',
+                      '95-99' = '97')))
+data.allfeatures$sex.numeric <- as.numeric(
+  as.character(recode(data.allfeatures$sex, 
+                      'F' = '0',
+                      'M' = '1')))
+data.allfeatures$apo_e4_allele.numeric <- as.numeric(
+  as.character(recode(data.allfeatures$apo_e4_allele, 
+                      'N' = '1',
+                      'Y' = '2',
+                      'N/A' = '0')))
+
+# recode all time to levels, eg. "<10 sec" as level 1
+data.allfeatures$longest_loc_duration.numeric <- as.numeric(
+  as.character(recode(data.allfeatures$longest_loc_duration,
+                      '< 10 sec' = '1',
+                      '10 sec - 1 min' = '2',
+                      '1-2 min' = '3',
+                      '3-5 min' = '4',
+                      '6-9 min' = '5',
+                      '10 min - 1 hr' = '6',
+                      '> 1 hr' = '7',
+                      'Unknown or N/A' = '0')))
+# recode act_demented
+data.allfeatures$act_demented <- as.numeric(data.allfeatures$act_demented) - 1
+```
+
+## Remove useless features
+
+Before we applying any feature deduction methods, we remove the columns that has over 80% zero values. By plottimg the percentage of 80% zero columns, it is clear that 25.67% columns have more 80% zero in their columns. (We got some problem when knit the plotting part, so we just comment the part when knitting. Instead of plotting, we generate a table for that.) After removing the 80%_zero columns, the demension of gene dataset has reduced from 50,000 to 40,000.
+
+```{r removing_80%zero_Genes}
+gene.name <- data.fpkm$gene_symbol
+gene.var <- numeric(length(gene.name))
+gene.zeros.percentage <- numeric(length(gene.name))
+
+# variance
+for (i in 1:length(gene.name)) {
+    #gene.var <- c(gene.var,var(data.allfeatures[,gene.name[i]]))
+  if (typeof(data.allfeatures[,gene.name[i]])=='double'){
+    gene.var[i] <- var(data.allfeatures[,gene.name[i]])
+  }
+  else{
+    gene.var[i] <- 0
+  }
+  zerocount=sum(data.allfeatures[,gene.name[i]]==0)
+  gene.zeros.percentage[i] <- zerocount/377
+  
+}
+gene.var.df <- data.frame(gene.name,gene.var,gene.zeros.percentage)
+
+# reduce the variables which have more than 80% zero
+zero.remove <- gene.var.df[gene.var.df$gene.zeros.percentage>0.8,]$gene.name
+zero.remove <- as.character(unlist(zero.remove))
+gene.names <-  gene.var.df[gene.var.df$gene.zeros.percentage<=0.8,]$gene.name
+gene.names <- as.character(unlist(gene.names))
+
+# remove the useless variables from data.allfeatures
+data.allfeatures.remove <- data.allfeatures[,!names(data.allfeatures) %in% zero.remove]
+data.allfeatures.numeric <- data.allfeatures.remove[, !names(data.allfeatures.remove) %in% c("longest_loc_duration", "structure_acronym", "age", "sex", "apo_e4_allele")]
+#data.allfeatures[,names(data.allfeatures) %in% zero.remove]
+
+# plot the gene information
+numall <- length(zero.remove)+length(gene.names)
+dt <- data.frame(num = (c(length(zero.remove), length(gene.names))), zero_per = c('> 80%', '<= 80%'), 
+                 percentage = (c((length(zero.remove)/numall), (length(gene.names)/numall))))
+dt
+```
+
+## EDA
+
+For exploratory data analysis, we have brought some ideas from aging.brain website. In the overview part, the website only uses the HIP region to do t-SNE over dementia status. That gives us hint to discover the relationship between brain region and dementia status. Firstly, we subset the dataset into four parts according to "structure_acronym". 
+
+```{r subset according to brain region}
+data.tcx <- subset(data.allfeatures, structure_acronym =='TCx')
+data.pcx <- subset(data.allfeatures, structure_acronym =='PCx')
+data.hip <- subset(data.allfeatures, structure_acronym =='HIP')
+data.fwm <- subset(data.allfeatures, structure_acronym =='FWM')
+```
+
+According to the official website, we know that no genes show a significant relationship to dementia. Moreover, t-SNE is computational intensive which means it needs more memory to calculate and very to abort R session. Thus, we select the non-gene features to do the t_SNE analysis.
+
+```{r nongene.features}
+nongene.features <- c("ihc_a_syn","ihc_tau2_ffpe","ihc_at8_ffpe","ihc_at8","ihc_ptdp_43_ffpe","ihc_a_beta_ffpe","ihc_a_beta","ihc_iba1_ffpe","ihc_gfap_ffpe","ptau_ng_per_mg","vegf_pg_per_mg","ab42_over_ab40_ratio","tnf_a_pg_per_mg","il_10_pg_per_mg","tau_ng_per_mg","isoprostane_pg_per_mg" ,"il_6_pg_per_mg","il_1b_pg_per_mg","ptau_over_tau_ratio","il_4_pg_per_mg","rantes_pg_per_mg","ab40_pg_per_mg","a_syn_pg_per_mg","ifn_g_pg_per_mg","mcp_1_pg_per_mg","bdnf_pg_per_mg","mip_1a_pg_per_mg","il_7_pg_per_mg","ab42_pg_per_mg","age.numeric","sex.numeric","apo_e4_allele.numeric","education_years","age_at_first_tbi","longest_loc_duration.numeric","num_tbi_w_loc")
+```
+
+### t_SNE on 4 brain region and all regions
+
+We can see from the following pics, samples are divided into two parts in each brain region. However, the clusters are not cluatered by dementia. We have tried sex as the label and samples are not clustered by sex either.
+
+```{r t-SNE on 4 brain region}
+plot_tsne <- function(df,name,features,perplexity){
+  set.seed(1)
+  data.label <- df$act_demented
+  data.matrix <- df[,names(data.allfeatures) %in% features]
+  tsne <- Rtsne(data.matrix,perplexity=perplexity)
+  df.tsne <- data.frame(dim1=tsne$Y[,1],dim2=tsne$Y[,2],labels=as.factor(data.label))
+  p <- ggplot(df.tsne,aes(dim1,dim2,col=labels))+geom_point()+ggtitle(name)
+  return(p)
+}
+
+#set.seed(1)
+
+
+p.tcx <- plot_tsne(data.tcx,"TCx",nongene.features,20)
+p.pcx <- plot_tsne(data.pcx,"PCx",nongene.features,20)
+p.hip <- plot_tsne(data.hip,"HIP",nongene.features,20)
+p.fwm <- plot_tsne(data.fwm,"FWM",nongene.features,20)
+grid.arrange(p.tcx,p.pcx,p.hip,p.fwm,ncol=2,top = textGrob("t-SNE plot",gp=gpar(fontsize=20,font=3)))
+```
+
+Compared with the overall part, the t-SNE plots of four brain region have separate into two parts. It is clear to see that the data can be clustered into two parts in each brain region. 
+
+```{r Overall t_SNE}
+p.all <- plot_tsne(data.allfeatures,"All",nongene.features,20)
+p.all
+```
+
+We also did a 3D tSNE plot of HIP brain region, and try to get a more intuitive visual result about relationship between dementia. However, the 3D plot does not help to answer the question. Samples with and without dementia are still mixed together.
+
+```{r 3d tSNE plot of HIP section}
+library(rgl)
+data.matrix <- data.hip[, names(data.allfeatures) %in% nongene.features]
+data.matrix$label <- data.hip$act_demented + 1
+set.seed(123)
+tsne <- Rtsne(data.matrix,dims=3,perplexity = 20)
+plot3d(x=tsne$Y[,1],y=tsne$Y[,2],z=tsne$Y[,3],
+       col=data.matrix$label,
+       type="s",radius=0.5)
+rgl::rglwidget()
+```
+
+### PCA on 4 brain region
+
+We also did PCA on 4 brain region and made 4 plots. Compared with PCA, t-SNE works better on this dataset. It is known that PCA and t-SNE are both dimension reduction algorithms. PCA is linear method while t_SNE is non-linear method. Based on the results, we made a hypothesis that non-linear cliassifier may perform better than linear classifier.
+
+```{r PCA on 4 brain region}
+#plot fucntion
+  plot_pca <- function(df, name) {
+  p <-
+  ggplot(subset(df, brain.region == name), aes(PC1, PC2, col = class)) +
+  geom_point() + ggtitle(name)
+  return(p)
+  }
+
+# build pca model
+cal_pca <-
+  function(data.allfeatures, features, name) {
+  # a vector of features and the name of the feature set
+  data.pca <-
+  prcomp(data.allfeatures[, names(data.allfeatures) %in% features])
+  # build a dataframe
+  df.data.pca <-
+  data.frame(
+  PC1 = data.pca$x[, 1],
+  PC2 = data.pca$x[, 2],
+  class = data.allfeatures$act_demented,
+  brain.region = data.allfeatures$structure_acronym
+  )
+  # apply plot
+  p.tcx <- plot_pca(df.data.pca, "TCx")
+  p.pcx <- plot_pca(df.data.pca, "PCx")
+  p.hip <- plot_pca(df.data.pca, "HIP")
+  p.fwm <- plot_pca(df.data.pca, "FWM")
+  grid.arrange(p.tcx,
+  p.pcx,
+  p.hip,
+  p.fwm,
+  ncol = 2,
+  top = textGrob(paste0(name, " PCA plot"), gp = gpar(fontsize = 20, font =
+  3)))
+  return(data.pca)
+  }
+cal_pca_var <- function(data.pca, name) {
+  # variance can be used in feature selection in part 2
+  total.variance <- sum(data.pca$sdev ^ 2)
+  # variance per component
+  var.explained <-
+  data.frame(
+  pc = seq(1:length(data.pca$sdev)),
+  feature_name = rownames(data.pca$rotation),
+  var.explained  = data.pca$sdev ^ 2 / total.variance
+  )
+  
+  
+  ggplot(var.explained, aes(pc, var.explained)) + geom_bar(stat = "identity") +
+  ggtitle(paste0(name, "DATA PCA VARIANCE")) 
+}
+
+# plot PCA
+pca.non.gene <- cal_pca(data.allfeatures, nongene.features,"Non-gene")
+```
+
+### Summary statistics
+
+We did some statistical visualisation on donors' backfrounds. 
+
+1. First plot shows the sex distribution on age, we could see that the number of male is slightly more than that of female on most ages. After applying sex distribution on the whole dataset, it is confirmed that male has more donors than female.
+
+2. The third figures mainly tells the sex density estimates over braak stage. It is interesting that females are more likely to be diagnosed as higher braak stage. The peak value of female density appears at stage 4 while that of male appears at stage 3.
+
+3. Furthermore, we generated a dementia status distribution on education years. In general, it is considered that people who are highly educated are less likely to get dementia when they are old. However, what surprises us is that education years does not have a strong relationship with dementia. 
+
+4. Besides, we also did a plot of chromosome distribution. As shown on the plot, the dataset contains most genes on chromosome 1 while least genes on chromosome MT.
+
+```{r Summary statistics ,fig.height = 6, fig.width = 9 }
+# summary of education years and dementia use setDT to keep the first row
+clinical.D <- subset(data.clinical, data.clinical$act_demented == "Dementia")
+clinical.N <- subset(data.clinical, data.clinical$act_demented == "No Dementia")
+D.table <- setDT(data.frame(summary(as.factor(clinical.D$education_years))),keep.rownames = TRUE)
+N.table <- setDT(data.frame(summary(as.factor(clinical.N$education_years))),keep.rownames = TRUE)
+names(D.table) <- c("education_year","D")
+names(N.table) <- c("education_year","N")
+education.count <- merge(D.table, N.table[, c("education_year","N")])
+education.count <- melt(education.count, id.vars = 'education_year')
+education.count$education_year <- as.factor(education.count$education_year)
+
+# summary of age with respect to gender
+
+   plot.age<-
+  ggplot(data.clinical,  aes(x = age,color=sex,fill=sex)) +  geom_bar(
+  ) + ggtitle("Sex distribution on years")
+  plot.sex <- ggplot(data.clinical,  aes(x = sex,fill=sex)) +  geom_bar(
+  ) + ggtitle("Total Sex distribution")
+  
+  #braak stage
+  plot.braak <-
+  ggplot(data.clinical, aes(x = braak, color=sex)) + geom_histogram(
+  aes(y = ..density..),fill='white',
+  binwidth = 1
+  ) + geom_density(alpha = .5, fill = "#FF6666")  + ggtitle("distribution of braak stage")
+  
+  # gene located in different chromosome
+  plot.chromosome <- ggplot(data.gene, aes(x=chromosome))+geom_bar(color="black",fill="white")+ggtitle("Numbers of gene located in different chromosome")
+  
+  plot.education <- ggplot(data.clinical, aes(x = education_years, color = act_demented, fill = act_demented))+
+    geom_bar(position = "dodge") + ggtitle("Dementia distribution on education years")
+
+  #ihc density
+
+grid.arrange(plot.age,plot.sex, plot.braak,plot.chromosome,plot.education,ncol = 2)
+```
+
+### Density plot on 4 brain region
+
+A density plot visualises the distribution of data over a continuous interval or time period. The dataframe used in this study contains more than 50,000 features, so we just took several features out to plot the density estimate. At this part we generate 4 plots over 2 type of ihc metrics and 2 types of gene expressions. As shown in the plots below, the 4 brains region has different density estimates over these 4 features. It is interesting that region PCx and region TCx have very similar results in both denstiy estimates and mean values over all 4 features. Especially in the second graph, they have almonst the same mean values and distributions.
+
+```{r density plot on 4 brain regions}
+plot_density <- function(fname){
+  data.mean <- data.frame(structure_acronym = c("FWM", "HIP", "PCx", "TCx"), mean = c(mean(data.fwm[,fname]), mean(data.hip[,fname]),
+                                                                                           mean(data.pcx[,fname]), mean(data.tcx[,fname])))
+  brain_density <- ggplot(data.allfeatures, aes(x=data.allfeatures[,fname], fill=structure_acronym)) +
+    geom_density(alpha=0.5) + geom_vline(data=data.mean, aes(xintercept=mean, color=structure_acronym),
+              linetype="dashed") + labs(title=paste("Density plot of", fname),x=fname)
+return(brain_density)
+}
+
+plot1 <- plot_density("ihc_at8")
+plot2 <- plot_density("ihc_a_beta_ffpe")
+plot3 <- plot_density("MIPEPP2")
+plot4 <- plot_density("LOC102723840")
+
+grid.arrange(plot1,plot2,plot3,plot4,ncol = 2)
+```
+
+### Identify outliers
+
+Boxplot is a good way to identify the outliers of a certian feature. However, as we said before, this dataframe contains too many features, we did some boxplots by picking out several features. As shown in the below, we did not find any significant outliers in these features. We could make the hypothesis that the dataset is pretty clean and contains less outliers. Since the dataset has less samples than features, we just ignore the small amount of outliers in case we did not have enough samples.
+
+```{r,fig.height=5 }
+# identify outlier
+# ihc  ImmunHistoChemistry
+mm.ihc <-
+  melt(
+  data.luminex,
+  id = c("donor_id", "structure_acronym"),
+  measure.vars = c("ihc_at8","ihc_a_beta_ffpe","ihc_a_beta","ihc_iba1_ffpe","ihc_gfap_ffpe")
+  )
+
+
+ggplot(mm.ihc, aes(x=structure_acronym,y=value)) +geom_boxplot() +facet_grid(variable~.)+
+    theme(text = element_text(size=12))+ggtitle("IHC boxplot")
+```
+
+
+# Part 1 Classifier to predict Dementia
+
+Splitting the data into train and test set
+
+```{r TrainTestSplit}
+set.seed(1)
+
+inTrain <- createDataPartition(data.allfeatures.numeric$act_demented, p = 0.5)[[1]]
+dataTrain <- data.allfeatures.numeric[inTrain,]
+dataTest <- data.allfeatures.numeric[-inTrain,]
+colnum <- which(colnames(dataTrain) == "act_demented")
+```
+
+##Feature Selection
+
+###KNN on all features (Baseline)
+
+```{r fitclassifier all features}
+#fitting the classifier on full expression dataset
+preds.all <- knn(train=dataTrain[,- colnum], test=dataTest[,- colnum], cl=dataTrain$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.all, dataTest$act_demented))
+acc.all = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cat("The accuracy by selecting all the features is", acc.all)
+```
+
+### P Test based feature selection pre processing
+
+P Test is considered as a standard preprocessing step for feature selection. It is considered a better approach than fold change. However, since this method doesnot takes into account the correlation between the features, therefore is not a robust method. Hence, in the later part we implement Random forest and Lasso regression for feature selection
+
+```{r ptest_based_feature_selection}
+dataTrain.byClass <- split(dataTrain[,-colnum], dataTrain$act_demented)
+# perform a t-test
+feature.pvalues <- c()
+for(i in 1:(ncol(dataTrain)-1)) {
+  feature.pvalues <- c(feature.pvalues, t.test(dataTrain.byClass[[1]][,i], dataTrain.byClass[[2]][,i])$p.value)
+}
+names(feature.pvalues) <- colnames(dataTrain[,-colnum])
+
+# filter the top 10000 most discriminative features based on p-values
+filtered.features2 <- names(sort(feature.pvalues)[1:10000])
+
+#Display KNN results on all and fold and p value based feature selection
+preds.pvalfiltered <- knn(train=dataTrain[,filtered.features2], test=dataTest[,filtered.features2],     cl=dataTrain$act_demented, k=3, prob=TRUE)
+table(preds.all, dataTest$act_demented)
+table(preds.pvalfiltered, dataTest$act_demented)
+```
+
+### Combining Donor information
+
+The top 10000 features selected from the P test doesnot have donor information features in them. In order to study the effect and importance of donor information we take a combination of donor information and the top features selected from the T test for our further analysis.
+
+```{r selecting features combination with donor information}
+selected.features <- c(filtered.features2, "age.numeric", "sex.numeric", "apo_e4_allele.numeric", "education_years", "age_at_first_tbi", "longest_loc_duration.numeric", "num_tbi_w_loc","structure_acronym.numeric", "act_demented")
+preds.pvalfiltered.donorinfo <- knn(train=dataTrain[, selected.features], test=dataTest[,selected.features],cl=dataTrain$act_demented, k=3, prob=TRUE)
+table(preds.pvalfiltered.donorinfo, dataTest$act_demented)
+```
+
+### Lasso Regression for feature selection
+
+We implement Lasso regression for selecting the top 10 features. The advantage of using Lasso over ridge regression lies in its capanility to give sparse results by making not important features as zero coefficient.
+
+```{r Lasso_Feat_Select on top filtered features from T test}
+
+# create learning matrix X and regression response variable Y
+selected.features.reg <- c(filtered.features2, "age.numeric", "sex.numeric", "apo_e4_allele.numeric", "education_years", "age_at_first_tbi", "longest_loc_duration.numeric", "num_tbi_w_loc","structure_acronym", "act_demented")
+
+
+x <- model.matrix(act_demented ~ ., data.allfeatures[,selected.features.reg])[,-1]
+y <- data.allfeatures$act_demented
+
+# partition the data into training and test sets (50% each)
+set.seed(12) 
+train <- sample(1:nrow(x), nrow(x)/2)
+test <- -train
+y.test <- y[test]
+
+# set the range of lambda values to be tested.
+grid <- 10^seq(8,-2, length=100)
+
+# alpha is the elasticnet mixing parameter with 0 correspond to Ridge regression and 1 correspond to Lasso and anything in between correspond to elastic net
+lasso.mod <- glmnet(x[train,], y[train], alpha=1, lambda=grid)
+dim(coef(lasso.mod))
+par(mfrow=c(1,2))
+plot(lasso.mod, xvar="lambda", label=TRUE)
+
+set.seed (12)
+# Using cross-validation for Lasso to find the best lambda (based on cvm "mean cross-validated error")
+cv.lasso <- cv.glmnet (x[train,], y[train], alpha=1)
+plot(cv.lasso)
+
+bestlam <- cv.lasso$lambda.min 
+# predict on test set using optimal lambda value estimated by CV
+lasso.pred <- predict (lasso.mod, s=bestlam, newx=x[test,]) 
+# Lasso for feature selection
+lasso.coef=predict(lasso.mod, type="coefficients", s=bestlam)
+selected.nongene.demented <- attr(lasso.coef,"Dimnames")[[1]][attr(lasso.coef,"i")+1][-1]
+```
+
+```{r Lasso to select top 10 features}
+print('Top 50 important features')
+abs_coeff <- abs(lasso.coef)
+sort_coeff <- abs_coeff[order(abs_coeff, decreasing = TRUE)[1:11], ]
+#selected.reg.colnames <- attr(sort_coeff,"Dimnames")[[1]][attr(sort_coeff,"i")+1][-1]
+top10_LR = names(sort_coeff)[names(sort_coeff) %in% names(dataTrain)]
+top10_LR
+```
+
+### Random Forest based feature selection
+
+We carry out Random Forest for feature selection. Thereafter we take top 10 features from this and build the model.
+
+```{r Bagging_feature_selection}
+data.copy <- dataTrain[,selected.features]
+names(data.copy) <- make.names(names(data.copy))
+bag.features <- randomForest(factor(act_demented)~., data=data.copy, importance=TRUE, mtry = length(selected.features)-1)
+#print(bag.features$importance)
+```
+```{r Scoring}
+scores = bag.features$importance  
+scores_gini = scores[,-1][,-1][,-1]
+top_RF = scores_gini[order(scores_gini, decreasing = TRUE)[1:10]]
+top_RF_sel = names(top_RF) 
+top_RF
+```
+
+## Model Development
+
+We try three different classifiers i.e. KNN, Logistic Regression and SVM on the top 10 features selected from lasso regression and Random Forest. KNN classifier is a simple and easy one, it exploits spatial symmetry by assuming that similar data points will lie in a cluster. In this way when we take k neighbor of a given data points, its highly likely to be upvoted by the class which it belongs to.  SVM can be a useful classifier when it comes to small dataset as it only uses support vectors to help build its erplane. However we also try logistic regression to compare and benchmark the model against SVM. In order to benchmark we look at the metrics like precision, accuracy, recall and f score.
+
+### Benchmark KNN with all features
+
+```{r benchmark knn}
+knn.model.ben <- knn(train=dataTrain[,-colnum], test=dataTest[,-colnum], cl=dataTrain$act_demented, k=3, prob=TRUE)
+acc.knn.ben <- confusionMatrix(knn.model.ben, as.factor(dataTest$act_demented), positive="1")[3]$overall[1]
+precision.knn.ben <- posPredValue(knn.model.ben, as.factor(dataTest$act_demented), positive="1")
+recall.knn.ben <- sensitivity(knn.model.ben, as.factor(dataTest$act_demented), positive="1")
+F1.knn.ben <- (2 * precision.knn.ben * recall.knn.ben) / (precision.knn.ben + recall.knn.ben)
+cat("The benchmark accuracy is", acc.knn.ben)
+cat("\nThe benchmark recall is", recall.knn.ben)
+cat("\nThe benchmark precision is", precision.knn.ben)
+cat("\nThe benchmark F1 score is", F1.knn.ben)
+
+```
+
+### KNN
+
+KNN model on the lasso selected features
+
+```{r Lasso selected features}
+knn.model.lr <- knn(train=dataTrain[,top10_LR], test=dataTest[,top10_LR], cl=dataTrain$act_demented, k=3, prob=TRUE)
+acc.knn.lr <- confusionMatrix(knn.model.lr, as.factor(dataTest$act_demented), positive="1")[3]$overall[1]
+confusionMatrix(knn.model.lr, as.factor(dataTest$act_demented), positive="1")
+```
+
+Precision Recall and F1 score
+
+```{r prec recall f score KNN}
+precision.knn.lr <- posPredValue(knn.model.lr, as.factor(dataTest$act_demented), positive="1")
+recall.knn.lr <- sensitivity(knn.model.lr, as.factor(dataTest$act_demented), positive="1")
+F1.knn.lr <- (2 * precision.knn.lr * recall.knn.lr) / (precision.knn.lr + recall.knn.lr)
+cat("\nThe recall is", recall.knn.lr)
+cat("\nThe precision is", precision.knn.lr)
+cat("\nThe F1 score is", F1.knn.lr)
+```
+
+KNN model on Random forest selected features
+
+```{r Random Forest selected features}
+knn.model.rf <- knn(train=dataTrain[,top_RF_sel], test=dataTest[,top_RF_sel], cl=dataTrain$act_demented, k=3, prob=TRUE)
+acc.knn.rf <- confusionMatrix(knn.model.rf, as.factor(dataTest$act_demented), positive="1")[3]$overall[1]
+confusionMatrix(knn.model.rf, as.factor(dataTest$act_demented), positive="1")
+```
+
+
+```{r Random Forest KNN prec recall f score}
+precision.knn.rf <- posPredValue(knn.model.rf, as.factor(dataTest$act_demented), positive="1")
+recall.knn.rf <- sensitivity(knn.model.rf, as.factor(dataTest$act_demented), positive="1")
+F1.knn.rf <- (2 * precision.knn.rf * recall.knn.rf) / (precision.knn.rf + recall.knn.rf)
+cat("\nThe recall is", recall.knn.rf)
+cat("\nThe precision is", precision.knn.rf)
+cat("\nThe F1 score is", F1.knn.rf)
+```
+
+### Logistic Regression
+
+Logistic Regression Classifier on the lasso selected features
+
+```{r logistic regression on features by lasso regression (lr)}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+logit.model.lr <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top10_LR, "act_demented")],
+                     method = "glm", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.lr <- predict(logit.model.lr, newdata = dataTest[,top10_LR])
+acc.lr.LR <- confusionMatrix(logit.pred.lr, as.factor(dataTest$act_demented), positive="1")[3]$overall[1]
+confusionMatrix(logit.pred.lr, as.factor(dataTest$act_demented), positive="1")
+```
+
+```{r prec recall f score for features selection by Lasso regression (lr)}
+predictions.lr.LR = predict(logit.model.lr, newdata = dataTest[,top10_LR])
+precision.lr.LR <- posPredValue(predictions.lr.LR, as.factor(dataTest$act_demented), positive="1")
+recall.lr.LR <- sensitivity(predictions.lr.LR, as.factor(dataTest$act_demented), positive="1")
+
+F1.lr.LR <- (2 * precision.lr.LR * recall.lr.LR) / (precision.lr.LR + recall.lr.LR)
+cat("\nThe recall is", recall.lr.LR)
+cat("\nThe precision is", precision.lr.LR)
+cat("\nThe F1 score is", F1.lr.LR)
+```
+
+Logistic Regression on the Random Forest based selected features
+
+```{r logistic regression for RF Selected features}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+logit.model.rf <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top_RF_sel, "act_demented")],
+                     method = "glm", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.rf <- predict(logit.model.rf, newdata = dataTest[,top_RF_sel])
+acc.lr.rf <- confusionMatrix(logit.pred.rf, as.factor(dataTest$act_demented), positive="1")[3]$overall[1]
+confusionMatrix(logit.pred.rf, as.factor(dataTest$act_demented), positive="1")
+```
+
+```{r Random Forest prec recall f score}
+predictions.rf = predict(logit.model.rf, newdata = dataTest[,top_RF_sel])
+precision.lr.rf <- posPredValue(predictions.rf, as.factor(dataTest$act_demented), positive="1")
+recall.lr.rf <- sensitivity(predictions.rf, as.factor(dataTest$act_demented), positive="1")
+
+F1.lr.rf <- (2 * precision.lr.rf * recall.lr.rf) / (precision.lr.rf + recall.lr.rf)
+cat("\nThe recall is", recall.lr.rf)
+cat("\nThe precision is", precision.lr.rf)
+cat("\nThe F1 score is", F1.lr.rf)
+```
+
+### SVM
+
+```{r SVM on features by lasso regression (lr)}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+logit.model.svm <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top10_LR, "act_demented")],
+                     method = "svmLinear", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.svm <- predict(logit.model.svm, newdata = dataTest[,top10_LR])
+acc.svm.lr <- confusionMatrix(logit.pred.svm, as.factor(dataTest$act_demented))[3]$overall[1]
+confusionMatrix(logit.pred.svm, as.factor(dataTest$act_demented))
+```
+
+```{r SVM_lasso recall f1-score precision}
+predictions.svm = predict(logit.model.svm, newdata = dataTest[,top10_LR])
+precision.svm.lr <- posPredValue(predictions.svm, as.factor(dataTest$act_demented), positive="1")
+recall.svm.lr <- sensitivity(predictions.svm, as.factor(dataTest$act_demented), positive="1")
+
+F1.svm.lr <- (2 * precision.svm.lr * recall.svm.lr) / (precision.svm.lr + recall.svm.lr)
+
+cat("\nThe recall is", recall.svm.lr)
+cat("\nThe precision is", precision.svm.lr)
+cat("\nThe F1 score is", F1.svm.lr)
+```
+
+```{r SVM for RF Selected features}
+# we split fresh because take the column structure_acronym is taken and not structure_acronym.numeric
+logit.model.svm <- train(as.factor(act_demented) ~ . ,
+                     data = dataTrain[,c(top_RF_sel, "act_demented")],
+                     method = "svmLinear", family = binomial(link = 'logit'), 
+                     trControl = trainControl(method = "repeatedcv", 
+                                              repeats = 5))
+
+logit.pred.svm <- predict(logit.model.svm, newdata = dataTest[,top_RF_sel])
+acc.svm.rf <- confusionMatrix(logit.pred.svm, as.factor(dataTest$act_demented))[3]$overall[1]
+confusionMatrix(logit.pred.svm, as.factor(dataTest$act_demented))
+```
+
+```{r SVM_randomforest recall f1-score precision}
+predictions.svm = predict(logit.model.svm, newdata = dataTest[,top_RF_sel])
+precision.svm.rf <- posPredValue(predictions.svm, as.factor(dataTest$act_demented), positive="1")
+recall.svm.rf <- sensitivity(predictions.svm, as.factor(dataTest$act_demented), positive="1")
+
+F1.svm.rf <- (2 * precision.svm.rf * recall.svm.rf) / (precision.svm.rf + recall.svm.rf)
+cat("\nThe recall is", recall.svm.rf)
+cat("\nThe precision is", precision.svm.rf)
+cat("\nThe F1 score is", F1.svm.rf)
+```
+
+### Quality metrics plot
+
+We generated some plots for quality metrics of 3 different classifiers.
+
+```{r plotting results}
+accuracy.knn.lr.svm.LR <- c(acc.knn.lr, acc.lr.LR, acc.svm.lr)
+accuracy.knn.lr.svm.RF <- c(acc.knn.rf, acc.lr.rf, acc.svm.rf)
+
+recall.knn.lr.svm.LR <- c(recall.knn.lr, recall.lr.LR, recall.svm.lr)
+recall.knn.lr.svm.RF <- c(recall.knn.rf, recall.lr.rf, recall.svm.rf)
+
+precision.knn.lr.svm.LR <- c(precision.knn.lr, precision.lr.LR, precision.svm.lr)
+precision.knn.lr.svm.RF <- c(precision.knn.rf, precision.lr.rf, precision.svm.rf)
+
+f1score.knn.lr.svm.LR <- c(F1.knn.lr, F1.lr.LR, F1.svm.lr)
+f1score.knn.lr.svm.RF <- c(F1.knn.rf, F1.lr.rf, F1.svm.rf)
+
+
+
+classifiers = c("KNN", "LR", "SVM")
+
+
+
+df.result <- data.frame(classifiers, acc.LR=accuracy.knn.lr.svm.LR, acc.RF=accuracy.knn.lr.svm.RF, 
+                        recall.lr = recall.knn.lr.svm.LR, recall.rf = recall.knn.lr.svm.RF, 
+                        precision.lr = precision.knn.lr.svm.LR, precision.rf = precision.knn.lr.svm.RF,
+                        f1score.lr = f1score.knn.lr.svm.LR, f1score.rf = f1score.knn.lr.svm.RF)
+
+
+plot1 <- ggplot(df.result, aes(classifiers)) + 
+  geom_line(aes(y = acc.LR, colour = "Lasso", group=1)) + 
+  geom_line(aes(y = acc.RF, colour = "Random Forest", group=1))+
+  geom_point(data=df.result,aes(x=classifiers,y=acc.LR,colour = "Lasso"))+
+  geom_point(data=df.result,aes(x=classifiers,y=acc.RF,colour = "Random Forest"))
+
+plot2 <- ggplot(df.result, aes(classifiers)) + 
+  geom_line(aes(y = recall.lr, colour = "Lasso", group=1)) + 
+  geom_line(aes(y = recall.rf, colour = "Random Forest", group=1))+
+  geom_point(data=df.result,aes(x=classifiers,y=recall.lr,colour = "Lasso"))+
+  geom_point(data=df.result,aes(x=classifiers,y=recall.rf,colour = "Random Forest"))
+
+plot3 <- ggplot(df.result, aes(classifiers)) + 
+  geom_line(aes(y = precision.lr, colour = "Lasso", group=1)) + 
+  geom_line(aes(y = precision.rf, colour = "Random Forest", group=1))+
+  geom_point(data=df.result,aes(x=classifiers,y=precision.lr,colour = "Lasso"))+
+  geom_point(data=df.result,aes(x=classifiers,y=precision.rf,colour = "Random Forest"))
+
+plot4 <- ggplot(df.result, aes(classifiers)) + 
+  geom_line(aes(y = f1score.lr, colour = "Lasso", group=1)) + 
+  geom_line(aes(y = f1score.rf, colour = "Random Forest", group=1))+
+  geom_point(data=df.result,aes(x=classifiers,y=f1score.lr,colour = "Lasso"))+
+  geom_point(data=df.result,aes(x=classifiers,y=f1score.rf,colour = "Random Forest"))
+
+
+grid.arrange(plot1, plot2, plot3, plot4, ncol = 2, nrow =2)
+```
+
+### Experiment to see the most important Non gene features
+
+Here we try to identify the most important non gene features using the lasso regression. We found an interesting result that non gene feature "ihc_at8_ffpe" and "ihc_tau2_ffpe" plays an important role in prediciting dementia. They are the part of the top 10 features selected by lasso regression. Furthermore, education years is the only donor information that plays a role in predicting dementia.
+
+```{r Lasso_FeatureSelection_only on Non Gene}
+
+# create learning matrix X and regression response variable Y
+#selected.features.reg <- c(filtered.features2, "age", "sex", "apo_e4_allele", "education_years", "age_at_first_tbi", "longest_loc_duration", "num_tbi_w_loc","structure_acronym", "act_demented")
+
+nongene.features <- c("ihc_a_syn","ihc_tau2_ffpe","ihc_at8_ffpe","ihc_at8","ihc_ptdp_43_ffpe","ihc_a_beta_ffpe","ihc_a_beta","ihc_iba1_ffpe","ihc_gfap_ffpe","ptau_ng_per_mg","vegf_pg_per_mg","ab42_over_ab40_ratio","tnf_a_pg_per_mg","il_10_pg_per_mg","tau_ng_per_mg","isoprostane_pg_per_mg" ,"il_6_pg_per_mg","il_1b_pg_per_mg","ptau_over_tau_ratio","il_4_pg_per_mg","rantes_pg_per_mg","ab40_pg_per_mg","a_syn_pg_per_mg","ifn_g_pg_per_mg","mcp_1_pg_per_mg","bdnf_pg_per_mg","mip_1a_pg_per_mg","il_7_pg_per_mg","ab42_pg_per_mg","age.numeric","sex.numeric","apo_e4_allele.numeric","education_years","age_at_first_tbi","longest_loc_duration.numeric","num_tbi_w_loc")
+
+x <- model.matrix(act_demented ~ ., data.allfeatures[,c(nongene.features,"structure_acronym", "act_demented")])[,-1]
+y <- data.allfeatures$act_demented
+
+# partition the data into training and test sets (50% each)
+set.seed(1) 
+train <- sample(1:nrow(x), nrow(x)/2)
+test <- -train
+y.test <- y[test]
+
+# set the range of lambda values to be tested.
+grid <- 10^seq(8,-2, length=100)
+
+# alpha is the elasticnet mixing parameter with 0 correspond to Ridge regression and 1 correspond to Lasso and anything in between correspond to elastic net
+lasso.mod <- glmnet(x[train,], y[train], alpha=1, lambda=grid)
+dim(coef(lasso.mod))
+par(mfrow=c(1,2))
+plot(lasso.mod, xvar="lambda", label=TRUE)
+
+set.seed (1)
+# Using cross-validation for Lasso to find the best lambda (based on cvm "mean cross-validated error")
+cv.lasso <- cv.glmnet (x[train,], y[train], alpha=1)
+plot(cv.lasso)
+
+bestlam <- cv.lasso$lambda.min 
+# predict on test set using optimal lambda value estimated by CV
+lasso.pred <- predict (lasso.mod, s=bestlam, newx=x[test,]) 
+# Lasso for feature selection
+lasso.coef=predict(lasso.mod, type="coefficients", s=bestlam)
+selected.nongene.demented <- attr(lasso.coef,"Dimnames")[[1]][attr(lasso.coef,"i")+1][-1]
+```
+* We observe that the non gene feature "ihc_at8_ffpe" and "ihc_tau2_ffpe" plays an important role in prediciting dementia. 
+
+```{r Lasso to select top 10}
+abs_coeff <- abs(lasso.coef)
+cat('\nTop 10 most important non gene features\n')
+names(abs_coeff[order(abs_coeff, decreasing = TRUE)[1:10], ])
+cat('Top 10 most important overall features\n', top10_LR,"\n")
+```
+
+### Exploring Brain regions
+An experiment is run to build model on different brain region. Did this to identify different brain regions importance in predicting dementia. We found that the information collected from the brain region HIP and PCX were important in predicting dementia than the other two regions TCx and FWM
+```{r comparing brain regions to see if model developed on individual region gives any insight}
+
+data.allfeatures[is.na(data.allfeatures)] <- 0
+
+data.tcx <- subset(data.allfeatures, structure_acronym =='TCx')
+data.pcx <- subset(data.allfeatures, structure_acronym =='PCx')
+data.hip <- subset(data.allfeatures, structure_acronym =='HIP')
+data.fwm <- subset(data.allfeatures, structure_acronym =='FWM')
+
+set.seed(1)
+
+inTraint <- createDataPartition(data.tcx$act_demented, p = 0.5)[[1]]
+inTrainp <- createDataPartition(data.pcx$act_demented, p = 0.5)[[1]]
+inTrainh <- createDataPartition(data.hip$act_demented, p = 0.5)[[1]]
+inTrainf <- createDataPartition(data.fwm$act_demented, p = 0.5)[[1]]
+
+data.tcx.train <-data.tcx[inTraint,]
+data.tcx.test <- data.tcx[-inTraint,]
+data.pcx.train <- data.pcx[inTrainp,]
+data.pcx.test <- data.pcx[-inTrainp,]
+
+data.hip.train <-data.hip[inTrainh,]
+data.hip.test <- data.hip[-inTrainh,]
+data.fwm.train <- data.fwm[inTrainf,]
+data.fwm.test <- data.fwm[-inTrainf,]
+
+data.tcx.train <- as.data.frame(sapply(data.tcx.train, as.numeric))
+data.tcx.test <- as.data.frame(sapply(data.tcx.test, as.numeric))
+
+
+data.pcx.train <- as.data.frame(sapply(data.pcx.train, as.numeric))
+data.pcx.test <- as.data.frame(sapply(data.pcx.test, as.numeric))
+
+data.hip.train <- as.data.frame(sapply(data.hip.train, as.numeric))
+data.hip.test <- as.data.frame(sapply(data.hip.test, as.numeric))
+
+data.fwm.train <- as.data.frame(sapply(data.fwm.train, as.numeric))
+data.fwm.test <- as.data.frame(sapply(data.fwm.test, as.numeric))
+
+# TCx
+colnum <- which(colnames(data.tcx.train) == "act_demented")
+preds.tcx <- knn(train=data.tcx.train[, top_RF_sel], test=data.tcx.test[, top_RF_sel], cl=data.tcx.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.tcx, data.tcx.test$act_demented))
+acc.tcx = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cm.t= cm.all
+table(preds.tcx, data.tcx.test$act_demented)
+
+
+precision.tcx <- posPredValue(preds.tcx, as.factor(data.tcx.test$act_demented), positive="1")
+recall.tcx <- sensitivity(preds.tcx, as.factor(data.tcx.test$act_demented), positive="1")
+F1.tcx <- (2 * precision.tcx * recall.tcx) / (precision.tcx + recall.tcx)
+
+# PCx
+colnum <- which(colnames(data.pcx.train) == "act_demented")
+preds.pcx <- knn(train=data.pcx.train[,top_RF_sel], test=data.pcx.test[, top_RF_sel], cl=data.pcx.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.pcx, data.pcx.test$act_demented))
+acc.pcx = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cm.p = cm.all
+table(preds.pcx, data.pcx.test$act_demented)
+
+precision.pcx <- posPredValue(preds.pcx, as.factor(data.pcx.test$act_demented), positive="1")
+recall.pcx <- sensitivity(preds.pcx, as.factor(data.pcx.test$act_demented), positive="1")
+F1.pcx <- (2 * precision.pcx * recall.pcx) / (precision.pcx + recall.pcx)
+
+# HIP
+colnum <- which(colnames(data.hip.train) == "act_demented")
+preds.hip <- knn(train=data.hip.train[,top_RF_sel], test=data.hip.test[, top_RF_sel], cl=data.hip.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.hip, data.hip.test$act_demented))
+acc.hip = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cm.h = cm.all
+table(preds.hip, data.hip.test$act_demented)
+
+precision.hip <- posPredValue(preds.hip, as.factor(data.hip.test$act_demented), positive="1")
+recall.hip <- sensitivity(preds.hip, as.factor(data.hip.test$act_demented), positive="1")
+F1.hip <- (2 * precision.hip * recall.hip) / (precision.hip + recall.hip)
+
+# FWM
+colnum <- which(colnames(data.fwm.train) == "act_demented")
+preds.fwm <- knn(train=data.fwm.train[,top_RF_sel], test=data.fwm.test[, top_RF_sel], cl=data.fwm.train$act_demented, k=3, prob=TRUE)
+cm.all = as.matrix( table(preds.fwm, data.fwm.test$act_demented))
+acc.fwm = (cm.all[1]+cm.all[4])/(cm.all[1]+cm.all[2]+ cm.all[3] +cm.all[4])
+cm.f = cm.all
+table(preds.fwm, data.fwm.test$act_demented)
+
+precision.fwm <- posPredValue(preds.fwm, as.factor(data.fwm.test$act_demented), positive="1")
+recall.fwm <- sensitivity(preds.fwm, as.factor(data.fwm.test$act_demented), positive="1")
+F1.fwm <- (2 * precision.fwm * recall.fwm) / (precision.fwm + recall.fwm)
+
+# Comparison on 4 brain region
+brain.metrics <- data.frame(structure_acronym = c("FWM", "HIP", "PCx", "TCx"),
+                            accuracy = c(acc.fwm,acc.hip,acc.pcx,acc.tcx),
+                            recall = c(recall.fwm,recall.hip,recall.pcx,recall.tcx),
+                            precision = c(precision.fwm, precision.hip, precision.pcx, precision.tcx),
+                            f1_score = c(F1.fwm,F1.hip,F1.pcx,F1.tcx)
+                            )
+brain.metrics
+```
+
+#### Conclusion part 1
+
+We found that gene information plays an important role in predicting dementia then pathological or donor information.
+
+We find that both logistic regression and support vector machine performs well. However KNN might not be a robust classifier, as it does not performs well for Lasso based feature selection.
+
+We also found that information collected from Hippocampus and Parietal brain region plays important role in predicting dementia compared to the brain region temporal neocortex and white matter of forebrain.
+
+
+# Part 2 Additional analysis
+
+Problems:
+
+* Are gene expressions sex dependent?(classification)
+* Are gene expressions on X, Y chromosomes able to differentiate brain regions? (Clustering)
+
+We all have the knowledge that, gene expressions are closely related with gender. In this section, we try to prove the fact by implementing classification according to gender by using the un-normalized FPKM values. The experiment can be roughly devided into 3 parts:
+
+1. Gender classification using all the gene expressions(excluding the sparse ones we have identified before
+2. Gender classification using selected features, these features would be selected via t-test technique by comparing the p-values. 
+3. Gender classification using gene features which are not located at sex chromosomes to see if there is a relationship.
+4. Brain region clustering using PCA results of sexual chromosomes correlated genes.
+
+## Gender classification using all the gene expressions(benchmark)
+
+First of all, we use a total of 37,372 genes across 26 chromosomes. Since there is no requirement about samples linearly separable, we just use Knn classifier to fit the dataset. However, the accuracy is only 58%, which is not good because it is a binary classification, a random guess would have 50% accuracy. At the mean time, we also notice that the model has a higher specificity value, meaning that samples in the female cluster are more likely to be assigned to male class. This can be caused by that Knn classifier relies heavily on the information of the observations' neighbors which may be affected by noisy data since we input a high-dimensional dataset with dimensions p larger than the number of samples.
+
+```{r train and test plit on sex}
+data.allfeatures.remove$sex <- as.character(data.allfeatures.remove$sex)
+data.allfeatures.remove$sex[which(data.allfeatures.remove$sex=='F')] <- 'Female'
+data.allfeatures.remove$sex <- as.factor(data.allfeatures.remove$sex)
+set.seed(123)
+inTrain <- createDataPartition(data.allfeatures.remove$sex, p = .5)[[1]]
+sex.Train <- data.allfeatures.remove[ inTrain, c(gene.names,'sex')]
+sex.Test  <- data.allfeatures.remove[-inTrain, c(gene.names,'sex')]
+sex.Train.byClass <- split(sex.Train[,gene.names], sex.Train$sex)
+# fitting the classifier on full expression dataset
+knn.full <- knn(train=sex.Train[,gene.names], test=sex.Test[,gene.names], cl=sex.Train$sex, k=3, prob=TRUE)
+confusionMatrix(knn.full, sex.Test$sex)
+```
+
+## Gender classification using selected features
+
+For the purpose of improving the classification the these features would be selected by comparing the p-values via t-test technique. 
+
+It is interesting to see that the top 30 most discriminative features based on p-values are all located on the X and Y chromosomes and the majority are from Y chromosome, which follows a common sense. The result is also worth mention here since this time we get a model with 100% accuracy.
+
+```{r t-test on gene features}
+#set.seed(1)
+# perform a t-test
+sex.feature.pvalues <- c()
+for(i in 1:(length(gene.names))) {
+  sex.feature.pvalues <- c(sex.feature.pvalues, t.test(sex.Train.byClass[[1]][,gene.names[i]], sex.Train.byClass[[2]][,gene.names[i]])$p.value)
+}
+names(sex.feature.pvalues) <- gene.names
+
+# filter the top 30 most discriminative features based on p-values
+filtered.features2 <- names(sort(sex.feature.pvalues)[1:30])
+# where the gene located
+table(data.gene[data.gene$gene_symbol %in% filtered.features2,]$chromosome)
+```
+
+```{r}
+knn.selected <- knn(train=sex.Train[,filtered.features2], test=sex.Test[,filtered.features2], cl=sex.Train$sex, k=3, prob=TRUE)
+confusionMatrix(knn.selected, sex.Test$sex)
+```
+
+Now let's try to figure out the relationship between preditors and the response. Because knn classifier is not able to give us knowledge about it, we changed the algorithm to SVM(Support Vector Machine). The first svm model is using a linear kenerl, though the accuracy is still very high, there is one male sample mis-classified to female class. Once we changed the kernel method to sigmoid,it predicts exactly 100% percent correct result. We can draw the conclusions as following:
+
+* These gene expressions contains different gender patterns that can be used to differentiate the sex of observations
+* These selected gene expressions do not follow a linear pattern strictly, and it can be verified by the t-sne graph displayed below.
+* The sigmoid kernel outperforms may due to that kernal extends the feature dimensions, in other words, it uses more insights within the features to make decisions.
+
+```{r svm model}
+svm.model.linear <- svm(x=sex.Train[,filtered.features2],y=sex.Train$sex,scale = T,kernel='linear')
+pred.linear<- predict(svm.model.linear,newdata = sex.Test[,filtered.features2])
+table(pred.linear, sex.Test$sex)
+
+svm.model.kernel <- svm(x=sex.Train[,filtered.features2],y=sex.Train$sex,scale = T,kernel='sigmoid')
+pred.kenerl<- predict(svm.model.kernel,newdata = sex.Test[,filtered.features2])
+table(pred.kenerl, sex.Test$sex)
+```
+
+With the help of t-sne method, we plot out the full observations according to the 30 selected gene expressions, there are 2 clear color coded clusters shown in the graph with a clear boundary. Interestingly, there is a male sample from temporal cortex clustered with the female class, exactly the same with the linear svm prediction. 
+
+```{r fig.height=3, fig.width=5}
+set.seed(2)
+data.label <- data.allfeatures.remove$sex
+data.matrix <- data.allfeatures.remove[,filtered.features2]
+tsne <- Rtsne(data.matrix,perplexity=5)
+df.tsne <- data.frame(dim1=tsne$Y[,1],dim2=tsne$Y[,2],labels=as.factor(data.label))
+p1 <- ggplot(df.tsne,aes(dim1,dim2,col=labels))+geom_point()+ggtitle("T-sne of 30 gene expressions\n on X,Y chromosomes")
+p1
+```
+```{r fig.height=10, fig.width=8}
+
+classcolors <- sapply(as.character(sex.Train$sex), switch,Female = "green3", M = "orange3")
+sexFiltered <- t(apply(sex.Train[,filtered.features2], 2, as.numeric))
+heatmap.2(sexFiltered, col=bluered(75), ColSideColors=classcolors, density.info="none", trace="none",scale='column', na.color = "black", main="Clustering by top 30 filtered features", dendrogram = "column")
+```
+## Gender classification using gene features on nonsexual chromosomes
+
+In the previous section, we identified the fact that, sexual chromosome genes are signification predictors to gender classification. According to the p-value, in the top 50 most important genes with responding to sex, only the 50-th gene is located at chromosome 8. Then we came up with the question weather genes located at other chromosomes are able to differiate gender? 
+
+Here, we just reuse the t-test result from last section but filter out those genes on X and Y chromosomes. Again, we first fit the dataset to a knn classifier, the accuracy is approx. 57% with 41% and 64% for sensitivity and specificity respectively. It seems that the genes on nonsexual chromosomes have little potiential to tell the gender of observations correctly as the accuracy is just slightly better than random guess.
+
+```{r}
+# the 50th gene
+data.gene[data.gene$gene_symbol %in% names(sort(sex.feature.pvalues)[50]),]
+# top 30 features not located on X and Y
+filtered.features3 <- names(sort(sex.feature.pvalues[names(sex.feature.pvalues) %in% data.gene$gene_symbol[!data.gene$chromosome %in% c('X','Y')]])[1:30])
+table(data.gene[data.gene$gene_symbol %in% filtered.features3,]$chromosome)
+
+knn.selected2 <- knn(train=sex.Train[,filtered.features3], test=sex.Test[,filtered.features3], cl=sex.Train$sex, k=2, prob=TRUE)
+confusionMatrix(knn.selected2, sex.Test$sex)
+
+```
+As for svm models, both of the linear and sigmoid kernel outperfrom over knn classifier with over 80% accuracy. It is interesting to see that the specificities are higher, potientially may due to the skewed samples with more male observations.
+
+```{r svm model 2}
+set.seed(12)
+svm.model.linear <- svm(x=sex.Train[,filtered.features3],y=sex.Train$sex,scale = T,kernel='linear')
+pred.linear<- predict(svm.model.linear,newdata = sex.Test[,filtered.features3])
+confusionMatrix(pred.linear, sex.Test$sex)
+
+svm.model.kernel <- svm(x=sex.Train[,filtered.features3],y=sex.Train$sex,scale = T,kernel='sigmoid')
+pred.kenerl<- predict(svm.model.kernel,newdata = sex.Test[,filtered.features3])
+confusionMatrix(pred.kenerl, sex.Test$sex)
+```
+
+Unlike the previous one, the t-sne graph of samples based on top-30 nonsexual genes displays a wide range of overlapping, following exactly the same pattern. As shown on the non-sexual t-SNE plot, the sexual-labelled data are not distinguished by sex, but are clustered into 4 parts.Based on that, We made an interesting hypothesis that the clusters maybe connected with 4 brain regions.
+
+```{r }
+set.seed(1)
+data.matrix2 <- data.allfeatures.remove[,filtered.features3]
+tsne2 <- Rtsne(data.matrix2,perplexity=15)
+df.tsne2 <- data.frame(dim1=tsne2$Y[,1],dim2=tsne2$Y[,2],labels=as.factor(data.label))
+p2 <- ggplot(df.tsne2,aes(dim1,dim2,col=labels))+geom_point()+ggtitle("T-sne of 30 gene expressions\n on nonsexual chromosomes")
+grid.arrange(p1,p2,ncol=2)
+```
+
+## Brain region clustering based on sexual chromosome genes
+
+One of the most important feature for these dataset is that, the gene expressions are collected from 4 different brain regions in cortex. We try to find out if these sexual gene expressions in different brains have different behaviors, in other words, we want to see if we can cluster the observations to 4 clusters according to these genes. At the first step, we applied a PCA on the gene expressions(1,820) for the purpose of dimensional reduction. Then, we plot the result of pca in 2-D style with color coded structure acronyms. Interestingly, Cortical white matter (FWM) is largely distinct from the other dots although with some overlap, whereas for the rest of brain regions, there are densely grouped together. Potentially, it is because we can not classify them with only 2 principle components.
+
+```{r fig.height=3, fig.width=5}
+sexual.genes <- names(data.allfeatures.remove)[names(data.allfeatures.remove) %in% data.gene$gene_symbol[data.gene$chromosome %in% c('X','Y')]]
+sexual.genes <- as.character(unlist(sexual.genes))
+length(sexual.genes)
+matrix.pca <- prcomp(data.allfeatures.remove[,sexual.genes])
+fviz_eig(matrix.pca)
+```
+
+The next step is to use the top 20 principle features to cluster the samples.
+Apart from FWM, we can also recognise HIP region as a cluster from the dendrogram, whereas PCx and TCx are piped together. It may be explained as PCx and TCx are both cortical grey matter(temporal cortex).
+
+```{r fig.height=3, fig.width=5}
+df.pca <- data.frame(PC1=matrix.pca$x[,1],PC2=matrix.pca$x[,2],labels=as.factor(data.allfeatures.remove$structure_acronym))
+p1 <- ggplot(df.pca,aes(PC1,PC2,col=labels))+geom_point()+ggtitle("PCA")
+grid.arrange(p1,ncol=1)
+```
+
+```{r}
+classcolors <- sapply(as.character(data.allfeatures.remove$structure_acronym), switch,FWM = "green3", HIP = "orange3",PCx='red3',TCx='blue3')
+pcaFiltered <- t(apply(matrix.pca$x[,1:20], 2, as.numeric))
+heatmap.2(pcaFiltered, col=bluered(75), ColSideColors=classcolors, density.info="none", trace="none",scale='column', na.color = "black", main="Clustering Brain Region according to PCA result", dendrogram = "column")
+```
+
+## conclusion
+
+* Gene expressions are significant predictors for gender.
+
+* In particular, the genes on X and Y chromosomes can exactly tell the sex infomation for a human.
+
+* Genes located on other chromosomes also contains sex infomation but it may be not accurate, probably affected by other body mystery.
+
+* We can separate samples from HIP and FWM according to X and Y chromosomes located genes whereas different cortical regions overlap(PCx and TCx).
+
+
+
+
+
